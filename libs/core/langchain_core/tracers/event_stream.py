@@ -21,7 +21,7 @@ from uuid import UUID
 
 from typing_extensions import NotRequired, TypedDict
 
-from langchain_core.callbacks.base import AsyncCallbackHandler
+from langchain_core.callbacks.base import BaseCallbackHandler,AsyncCallbackHandler
 from langchain_core.messages import AIMessageChunk, BaseMessage, BaseMessageChunk
 from langchain_core.outputs import (
     ChatGenerationChunk,
@@ -68,6 +68,8 @@ def _assign_name(name: Optional[str], serialized: Dict[str, Any]) -> str:
 
 T = TypeVar("T")
 
+class _StreamEventsCallbackHandler(BaseCallbackHandler, _StreamingCallbackHandler):
+    pass
 
 class _AstreamEventsCallbackHandler(AsyncCallbackHandler, _StreamingCallbackHandler):
     """An implementation of an async callback handler for astream events."""
@@ -744,8 +746,8 @@ async def _astream_events_implementation_v2(
         exclude_names=exclude_names,
         exclude_types=exclude_types,
         exclude_tags=exclude_tags,
-    )
-
+    ) # Part-1 StreamEventCallbackHandler
+    
     # Assign the stream handler to the config
     config = ensure_config(config)
     callbacks = config.get("callbacks")
