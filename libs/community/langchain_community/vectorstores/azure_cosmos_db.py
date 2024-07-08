@@ -399,6 +399,7 @@ class AzureCosmosDBVectorSearch(VectorStore):
         kind: CosmosDBVectorSearchType = CosmosDBVectorSearchType.VECTOR_IVF,
         ef_search: int = 40,
         score_threshold: float = 0.0,
+        filters:Optional[Dict] = None
     ) -> List[Tuple[Document, float]]:
         """Returns a list of documents with their scores
 
@@ -422,9 +423,9 @@ class AzureCosmosDBVectorSearch(VectorStore):
         """
         pipeline: List[dict[str, Any]] = []
         if kind == CosmosDBVectorSearchType.VECTOR_IVF:
-            pipeline = self._get_pipeline_vector_ivf(embeddings, k)
+            pipeline = self._get_pipeline_vector_ivf(embeddings, k, filters)
         elif kind == CosmosDBVectorSearchType.VECTOR_HNSW:
-            pipeline = self._get_pipeline_vector_hnsw(embeddings, k, ef_search)
+            pipeline = self._get_pipeline_vector_hnsw(embeddings, k, ef_search, filters)
 
         cursor = self._collection.aggregate(pipeline)
 
@@ -445,7 +446,7 @@ class AzureCosmosDBVectorSearch(VectorStore):
         return docs
 
     def _get_pipeline_vector_ivf(
-        self, embeddings: List[float], k: int = 4
+        self, embeddings: List[float], k: int = 4, filters:Optional[Dict] = None
     ) -> List[dict[str, Any]]:
         pipeline: List[dict[str, Any]] = [
             {
@@ -497,6 +498,7 @@ class AzureCosmosDBVectorSearch(VectorStore):
         kind: CosmosDBVectorSearchType = CosmosDBVectorSearchType.VECTOR_IVF,
         ef_search: int = 40,
         score_threshold: float = 0.0,
+        filters: Optional[Dict] = None
     ) -> List[Tuple[Document, float]]:
         embeddings = self._embedding.embed_query(query)
         docs = self._similarity_search_with_score(
@@ -505,6 +507,7 @@ class AzureCosmosDBVectorSearch(VectorStore):
             kind=kind,
             ef_search=ef_search,
             score_threshold=score_threshold,
+            filters=filters
         )
         return docs
 
@@ -523,6 +526,7 @@ class AzureCosmosDBVectorSearch(VectorStore):
             kind=kind,
             ef_search=ef_search,
             score_threshold=score_threshold,
+            **kwargs
         )
         return [doc for doc, _ in docs_and_scores]
 
