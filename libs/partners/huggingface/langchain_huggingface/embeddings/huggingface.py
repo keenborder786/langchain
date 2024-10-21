@@ -57,9 +57,10 @@ class HuggingFaceEmbeddings(BaseModel, Embeddings):
                 "Please install it with `pip install sentence-transformers`."
             ) from exc
 
-        self.client = sentence_transformers.SentenceTransformer(
-            self.model_name, cache_folder=self.cache_folder, **self.model_kwargs
-        )
+        if self.client is None:
+            self.client = sentence_transformers.SentenceTransformer(
+                self.model_name, cache_folder=self.cache_folder, **self.model_kwargs
+            )
 
     model_config = ConfigDict(
         extra="forbid",
