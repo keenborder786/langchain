@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import importlib
 import json
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
@@ -442,6 +444,55 @@ def _raise_empty_stream() -> NoReturn:
     raise FireworksError(msg)
 
 
+# Modules where the Fireworks SDK references `is_running_in_async_context`.
+# `fireworks.client.api_client` re-imports the helper into its own namespace
+# (`from .._util import is_running_in_async_context`), so the binding has to
+# be patched in *both* places to fully suppress the eager session creation
+# performed by `FireworksClient.__init__`.
+_FIREWORKS_ASYNC_CONTEXT_MODULES: tuple[str, ...] = (
+    "fireworks._util",
+    "fireworks.client.api_client",
+)
+
+
+@contextlib.contextmanager
+def _suppress_eager_aiohttp_sessions() -> Iterator[None]:
+    """Temporarily make the Fireworks SDK behave as if no event loop is running.
+
+    The Fireworks SDK eagerly constructs an `aiohttp.ClientSession` inside
+    `FireworksClient.__init__` whenever it detects a running event loop
+    (`is_running_in_async_context() is True`). Inside notebook kernels the
+    detection is always positive, so building a `ChatFireworks` allocates
+    four `aiohttp.ClientSession` objects (sync + async root client, each
+    with `_client_v1` and `_image_client_v1`). Sync `invoke` never touches
+    those sessions, and they leak as `Unclosed client session` warnings
+    when the model is garbage-collected.
+
+    Force the helper to report a sync context only while the SDK clients
+    are being constructed. The same SDK call site lazily recreates the
+    session inside `post_request_async_non_streaming` when an actual
+    async-non-streaming request is issued, so async functionality is
+    preserved.
+    """
+    patched: list[tuple[Any, Any]] = []
+    sentinel = object()
+    for module_name in _FIREWORKS_ASYNC_CONTEXT_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        original = getattr(module, "is_running_in_async_context", sentinel)
+        if original is sentinel:
+            continue
+        module.is_running_in_async_context = lambda: False  # type: ignore[attr-defined]
+        patched.append((module, original))
+    try:
+        yield
+    finally:
+        for module, original in patched:
+            module.is_running_in_async_context = original  # type: ignore[attr-defined]
+
+
 def _create_retry_decorator(
     llm: ChatFireworks,
     run_manager: AsyncCallbackManagerForLLMRun | CallbackManagerForLLMRun | None = None,
@@ -588,6 +639,25 @@ class ChatFireworks(BaseChatModel):
 
     async_client: Any = Field(default=None, exclude=True)
 
+    root_client: Any = Field(default=None, exclude=True)
+    """Underlying `fireworks.client.Fireworks` instance.
+
+    Retained on the model so its `httpx.Client` and `aiohttp.ClientSession`
+    can be deterministically released by `close()` / `__del__()`. Without
+    this back-reference the parent client would be garbage-collected
+    immediately after `validate_environment` returns, leaving an orphaned
+    `aiohttp.ClientSession` (which `aiohttp` then loudly complains about
+    on GC inside async contexts such as Jupyter kernels).
+    """
+
+    root_async_client: Any = Field(default=None, exclude=True)
+    """Underlying `fireworks.client.AsyncFireworks` instance.
+
+    Retained for the same reason as `root_client`; its `httpx.AsyncClient`
+    and lazily-created `aiohttp.ClientSession` are released through
+    `aclose()` / `__del__()`.
+    """
+
     model_name: str = Field(alias="model")
     """Model name to use."""
 
@@ -713,11 +783,166 @@ class ChatFireworks(BaseChatModel):
             "timeout": self.request_timeout,
         }
 
-        if not self.client:
-            self.client = Fireworks(**client_params).chat.completions
-        if not self.async_client:
-            self.async_client = AsyncFireworks(**client_params).chat.completions
+        # Suppress the SDK's eager `aiohttp.ClientSession` creation while the
+        # underlying clients are being built; the SDK lazily recreates them on
+        # demand when an actual async-non-streaming request is issued. See
+        # `_suppress_eager_aiohttp_sessions` for the full rationale.
+        with _suppress_eager_aiohttp_sessions():
+            if not self.client:
+                self.root_client = Fireworks(**client_params)
+                self.client = self.root_client.chat.completions
+            if not self.async_client:
+                self.root_async_client = AsyncFireworks(**client_params)
+                self.async_client = self.root_async_client.chat.completions
         return self
+
+    def _iter_inner_clients(self) -> Iterator[Any]:
+        """Yield every `FireworksClient` instance held by either root client.
+
+        `fireworks.client.Fireworks` / `AsyncFireworks` (from
+        `api_client_v2`) are thin wrappers that hold one or more inner
+        `FireworksClient` instances on private attributes — currently
+        `_client_v1` (chat/completions/embeddings) and `_image_client_v1`
+        (image inference). Each inner client owns a `httpx.Client`, a
+        `httpx.AsyncClient`, and (when constructed inside a running event
+        loop) an `aiohttp.ClientSession` — those are what we need to close.
+        """
+        seen: set[int] = set()
+        for attr in ("root_client", "root_async_client"):
+            root = getattr(self, attr, None)
+            if root is None:
+                continue
+            for inner_attr in ("_client_v1", "_image_client_v1"):
+                inner = getattr(root, inner_attr, None)
+                if inner is not None and id(inner) not in seen:
+                    seen.add(id(inner))
+                    yield inner
+
+    def close(self) -> None:
+        """Release the synchronously-closeable parts of every inner client.
+
+        Closes each inner `FireworksClient`'s `httpx.Client`. The
+        `httpx.AsyncClient` and `aiohttp.ClientSession` require an event
+        loop and are released by `aclose()` instead.
+
+        Safe to call repeatedly and safe to call before any request has
+        been issued.
+        """
+        for inner in self._iter_inner_clients():
+            try:
+                inner_close = getattr(inner, "close", None)
+                if callable(inner_close):
+                    inner_close()
+            except Exception:
+                logger.debug(
+                    "ChatFireworks.close: failed to close inner sync client",
+                    exc_info=True,
+                )
+
+    async def aclose(self) -> None:
+        """Asynchronously release every underlying network resource.
+
+        For each inner `FireworksClient` held by the wrapped sync and
+        async root clients, this closes the `httpx.AsyncClient` and the
+        `aiohttp.ClientSession` (lazily created when running inside an
+        event loop), then performs the synchronous teardown done by
+        `close()`.
+
+        Prefer this over relying on garbage collection — `aiohttp`
+        `ClientSession` objects emit a noisy `Unclosed client session`
+        warning when finalized without an explicit close.
+        """
+        for inner in self._iter_inner_clients():
+            inner_aclose = getattr(inner, "aclose", None)
+            if callable(inner_aclose):
+                try:
+                    await inner_aclose()
+                except Exception:
+                    logger.debug(
+                        "ChatFireworks.aclose: failed to close inner async client",
+                        exc_info=True,
+                    )
+        self.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    def __del__(self) -> None:
+        # Best-effort cleanup so orphaned `aiohttp.ClientSession` objects
+        # (held by every inner `FireworksClient`) don't leak when the
+        # model is garbage-collected without an explicit `aclose()` —
+        # common in notebooks where users overwrite the binding or re-run
+        # a cell.
+        #
+        # `__del__` may run at interpreter shutdown when modules are being
+        # torn down, so every step is wrapped in broad exception handlers.
+        with contextlib.suppress(Exception):
+            self.close()
+
+        try:
+            inner_clients = list(self._iter_inner_clients())
+        except Exception:
+            return
+
+        aiohttp_sessions: list[Any] = []
+        async_httpx_clients: list[Any] = []
+        for inner in inner_clients:
+            session = getattr(inner, "_aiohttp_session", None)
+            if session is not None and not getattr(session, "closed", True):
+                aiohttp_sessions.append(session)
+            async_httpx = getattr(inner, "_async_client", None)
+            if async_httpx is not None and not getattr(async_httpx, "is_closed", True):
+                async_httpx_clients.append(async_httpx)
+
+        if not aiohttp_sessions and not async_httpx_clients:
+            return
+
+        # Schedule the close on the running loop if one exists. Fire-and-
+        # forget because `__del__` cannot await; the loop drains the task
+        # before any aiohttp finalizer runs, so the warning is avoided.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            for session in aiohttp_sessions:
+                with contextlib.suppress(Exception):
+                    loop.create_task(session.close())
+            for client in async_httpx_clients:
+                with contextlib.suppress(Exception):
+                    loop.create_task(client.aclose())
+            return
+
+        # No running loop — drive the close on a private loop so the
+        # aiohttp sessions are actually awaited shut.
+        async def _close_async() -> None:
+            for session in aiohttp_sessions:
+                with contextlib.suppress(Exception):
+                    await session.close()
+            for client in async_httpx_clients:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
+
+        # Hold the coroutine in a local so we can explicitly close it if
+        # `asyncio.run` is unable to drive it (e.g. when the interpreter is
+        # mid-shutdown). Without that, the un-awaited coroutine surfaces as
+        # a `RuntimeWarning` exactly when the user can least act on it.
+        close_coro = _close_async()
+        try:
+            asyncio.run(close_coro)
+        except Exception:
+            with contextlib.suppress(Exception):
+                close_coro.close()
 
     def _resolve_model_profile(self) -> ModelProfile | None:
         return _get_default_model_profile(self.model_name) or None

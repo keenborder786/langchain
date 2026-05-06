@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -1140,3 +1141,71 @@ class TestServiceTier:
         result = model.invoke("Hello")
         assert isinstance(result, AIMessage)
         assert "service_tier" not in result.response_metadata
+
+
+class TestEagerAiohttpSessionSuppression:
+    """Regression tests for the eager `aiohttp.ClientSession` leak.
+
+    Constructing the underlying Fireworks SDK clients inside a running event
+    loop (e.g. a Jupyter notebook kernel) used to allocate one
+    `aiohttp.ClientSession` per inner client (4 in total). Sync `invoke`
+    never touched those sessions, so they leaked as `Unclosed client
+    session` warnings on garbage collection. `_suppress_eager_aiohttp_sessions`
+    forces the SDK to skip the eager allocation; the SDK still recreates
+    the session on demand inside `post_request_async_non_streaming`.
+
+    Recent Fireworks SDK versions (where the regression originates) expose
+    the `is_running_in_async_context` helper in `fireworks._util` /
+    `fireworks.client.api_client`; older pinned versions do not allocate any
+    aiohttp sessions at all. The tests adapt to whichever variant is
+    installed so the suite passes on both.
+    """
+
+    def test_no_eager_aiohttp_sessions_inside_event_loop(self) -> None:
+        async def build_model() -> ChatFireworks:
+            return _make_model()
+
+        loop = asyncio.new_event_loop()
+        try:
+            model = loop.run_until_complete(build_model())
+        finally:
+            loop.close()
+
+        try:
+            inner_clients = list(model._iter_inner_clients())
+            assert inner_clients, (
+                "Expected the Fireworks SDK to expose `_client_v1` and "
+                "`_image_client_v1` on both root clients."
+            )
+            for inner in inner_clients:
+                session = getattr(inner, "_aiohttp_session", None)
+                assert session is None, (
+                    "ChatFireworks must not let the Fireworks SDK eagerly "
+                    "construct an aiohttp.ClientSession during validation; "
+                    f"found {session!r} on {type(inner).__name__}."
+                )
+        finally:
+            model.close()
+
+    def test_async_context_helper_is_restored_after_construction(self) -> None:
+        """Patching of `is_running_in_async_context` must be scoped to init."""
+        modules: list[Any] = []
+        for module_name in ("fireworks._util", "fireworks.client.api_client"):
+            try:
+                module = __import__(module_name, fromlist=["_"])
+            except ImportError:
+                continue
+            if hasattr(module, "is_running_in_async_context"):
+                modules.append(module)
+        if not modules:
+            pytest.skip(
+                "Installed Fireworks SDK does not expose "
+                "`is_running_in_async_context`; nothing to patch."
+            )
+
+        before = [m.is_running_in_async_context for m in modules]
+
+        _make_model()
+
+        after = [m.is_running_in_async_context for m in modules]
+        assert before == after
